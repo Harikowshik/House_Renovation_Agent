@@ -1,6 +1,6 @@
 # 🏚️ 🍌 AI Home Renovation Planner (Streamlit App)
 
-An end-to-end multi-agent renovation planning and visual intelligence suite powered directly by the **Google GenAI SDK** (`gemini-3-flash-preview`) and **Streamlit**. Upload real room photos and inspiration styles, preserve your physical layout, calculate itemized budgets and ROI, analyze DIY savings, and export print-ready PDF and Markdown dossiers.
+An end-to-end multi-agent renovation planning and visual intelligence suite powered directly by the **Google GenAI** (`gemini-3-flash-preview`) and **Streamlit**. Upload real room photos and inspiration styles, preserve your physical layout, calculate itemized budgets and ROI, analyze DIY savings, and export print-ready PDF and Markdown dossiers.
 
 ---
 
