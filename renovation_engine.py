@@ -1,26 +1,28 @@
-"""AI Home Renovation Planner - Multi-Agent Engine (Direct Google GenAI SDK)
+"""AI Home Renovation Planner - LangGraph Multi-Agent Engine
 
-Implements the multi-agent renovation planning workflow:
-1. VisualAssessor: Vision AI analyzing room photos, locking physical layout, extracting styles.
-2. DesignPlanner: Surface finish specialist specifying materials, colors, and hardware.
-3. ProjectCoordinator: Budget breakdown, timeline, contractor checklist, and SLC rendering prompt.
-4. RenderingRefiner: Handles iterative delta modifications.
-5. ColorPaletteExtractor: Extracts structured HEX color swatches and materials.
-6. DIYvsProAnalyzer: Categorizes tasks into DIY savings vs licensed pro trades.
-7. ContractorRFQGenerator: Creates professional Request for Quotation emails/briefs.
-8. RenovationConsultant: 24/7 expert builder Q&A for permits, materials, and prep.
+Orchestrates specialized renovation agents using a LangGraph StateGraph:
+1. IntentParser: Extracts budget overrides, intent modes, and spatial flags.
+2. VisualAssessor: Vision AI analyzing room photos, locking physical layout, extracting styles.
+3. DesignPlanner: Surface finish specialist specifying materials, colors, and hardware.
+4. ProjectCoordinator: Budget breakdown, timeline, contractor checklist, and SLC rendering prompt.
+5. AnalyticsEngine: Color swatches (HEX), DIY vs Pro feasibility, material quantities, and resale ROI.
+6. VisualRenderer: Generates 8K photorealistic architectural interior renders.
+7. Refiner: Handles conversational delta tweaks and updates specifications.
+8. Consultant: 24/7 expert builder Q&A for permits, materials, and prep.
+9. ContractorRFQ: Drafts ready-to-send professional RFQ bid emails.
 """
 
 import os
 import json
 import re
 import logging
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Union, Generator, TypedDict
 from PIL import Image
 import io
 
 from google import genai
 from google.genai import types
+from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -719,3 +721,483 @@ Provide practical, contractor-grade guidance (prep steps, durability considerati
     except Exception as e:
         resp = client.models.generate_content(model=FALLBACK_VISION_MODEL, contents=prompt)
         return resp.text
+
+
+# ============================================================================
+# LANGGRAPH MULTI-AGENT STATE & GRAPH DEFINITION
+# ============================================================================
+
+class RenovationState(TypedDict, total=False):
+    # Execution mode: "full", "refine", "consultant", "rfq"
+    mode: str
+
+    # Configuration & Credentials
+    api_key: Optional[str]
+    model: str
+
+    # Inputs
+    user_prompt: str
+    room_type: str
+    target_style: str
+    budget_raw: str
+    current_image: Optional[Any]
+    inspiration_image: Optional[Any]
+    dimensions: Optional[Dict[str, float]]  # length_ft, width_ft, ceiling_ft
+    skip_rendering: bool
+
+    # Dynamic Intent & Constraint Parsing
+    effective_budget_str: str
+    effective_budget_num: float
+    is_prompt_budget: bool
+    intents: Dict[str, bool]
+    is_same_image: bool
+    directives_block: str
+
+    # Core Agent Outputs
+    assessment: str
+    design_plan: str
+    roadmap: str
+    slc_prompt: str
+
+    # Analytics Suite Outputs
+    color_palette: List[Dict[str, str]]
+    diy_breakdown: str
+    material_quantities: Dict[str, Any]
+    roi_info: Dict[str, Any]
+
+    # Visual Rendering Outputs
+    rendered_image: Optional[Any]
+    image_status: str
+
+    # Interactive Sub-Agent States
+    refinement_prompt: Optional[str]
+    consultant_question: Optional[str]
+    consultant_answer: Optional[str]
+    contractor_rfq: Optional[str]
+
+    # Graph Tracing
+    last_executed_node: str
+    execution_history: List[str]
+    error: Optional[str]
+
+
+def parse_intent_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 1: IntentParser - Extracts budget overrides and intent flags."""
+    user_prompt = state.get("user_prompt", "")
+    budget_raw = state.get("budget_raw", "$15,000")
+    current_image = state.get("current_image")
+    inspiration_image = state.get("inspiration_image")
+    room_type = state.get("room_type", "Kitchen")
+
+    effective_budget_str, effective_budget_num, is_prompt_budget = extract_budget_from_prompt(
+        user_prompt, budget_raw
+    )
+    intents = detect_renovation_intents(user_prompt)
+
+    is_same_image = False
+    if current_image is not None and inspiration_image is not None:
+        try:
+            if hasattr(current_image, "tobytes") and hasattr(inspiration_image, "tobytes"):
+                is_same_image = current_image.tobytes() == inspiration_image.tobytes()
+        except Exception:
+            pass
+
+    dims = state.get("dimensions") or {"length_ft": 14.0, "width_ft": 12.0, "ceiling_ft": 8.0}
+    quantities = calculate_material_quantities(
+        length_ft=dims.get("length_ft", 14.0),
+        width_ft=dims.get("width_ft", 12.0),
+        ceiling_ft=dims.get("ceiling_ft", 8.0),
+        room_type=room_type,
+    )
+    roi_info = estimate_home_roi(effective_budget_num, room_type)
+
+    history = list(state.get("execution_history") or [])
+    history.append("intent_parser")
+
+    return {
+        "effective_budget_str": effective_budget_str,
+        "effective_budget_num": effective_budget_num,
+        "is_prompt_budget": is_prompt_budget,
+        "intents": intents,
+        "is_same_image": is_same_image,
+        "material_quantities": quantities,
+        "roi_info": roi_info,
+        "last_executed_node": "intent_parser",
+        "execution_history": history,
+    }
+
+
+def route_by_mode(state: RenovationState) -> str:
+    """Conditional Edge Router: Directs workflow based on mode."""
+    mode = (state.get("mode") or "full").lower()
+    if mode == "consultant" or state.get("consultant_question"):
+        return "consultant_node"
+    if mode == "rfq":
+        return "contractor_rfq_node"
+    if mode == "refine" or state.get("refinement_prompt"):
+        return "refiner_node"
+    return "visual_assessor_node"
+
+
+def visual_assessor_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 2: VisualAssessor - Multimodal 360 layout lock and condition analysis."""
+    client = get_genai_client(state.get("api_key"))
+    model = state.get("model", DEFAULT_VISION_MODEL)
+
+    assessment = assess_room_and_inspiration(
+        client=client,
+        current_image=state.get("current_image"),
+        inspiration_image=state.get("inspiration_image"),
+        user_prompt=state.get("user_prompt", ""),
+        room_type=state.get("room_type", "Kitchen"),
+        budget=state.get("effective_budget_str", "$15,000"),
+        model=model,
+    )
+
+    history = list(state.get("execution_history") or [])
+    history.append("visual_assessor")
+    return {
+        "assessment": assessment,
+        "last_executed_node": "visual_assessor",
+        "execution_history": history,
+    }
+
+
+def design_planner_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 3: DesignPlanner - Surface finishes, exact paint codes, and stretch budget tier."""
+    client = get_genai_client(state.get("api_key"))
+    model = state.get("model", DEFAULT_VISION_MODEL)
+
+    plan = generate_design_plan(
+        client=client,
+        assessment_text=state.get("assessment", ""),
+        style_preference=state.get("target_style", "Modern Organic"),
+        room_type=state.get("room_type", "Kitchen"),
+        budget=state.get("effective_budget_str", "$15,000"),
+        user_prompt=state.get("user_prompt", ""),
+        model=model,
+    )
+
+    history = list(state.get("execution_history") or [])
+    history.append("design_planner")
+    return {
+        "design_plan": plan,
+        "last_executed_node": "design_planner",
+        "execution_history": history,
+    }
+
+
+def project_coordinator_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 4: ProjectCoordinator - Line-item budget, roadmap, trades checklist, and SLC 8K prompt."""
+    client = get_genai_client(state.get("api_key"))
+    model = state.get("model", DEFAULT_VISION_MODEL)
+
+    roadmap, slc_prompt = generate_project_roadmap(
+        client=client,
+        assessment_text=state.get("assessment", ""),
+        design_plan_text=state.get("design_plan", ""),
+        room_type=state.get("room_type", "Kitchen"),
+        budget=state.get("effective_budget_str", "$15,000"),
+        user_prompt=state.get("user_prompt", ""),
+        model=model,
+    )
+
+    history = list(state.get("execution_history") or [])
+    history.append("project_coordinator")
+    return {
+        "roadmap": roadmap,
+        "slc_prompt": slc_prompt,
+        "last_executed_node": "project_coordinator",
+        "execution_history": history,
+    }
+
+
+def analytics_engine_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 5: AnalyticsEngine - Palette HEX swatches, DIY vs Pro labor analysis, quantities, and ROI."""
+    client = get_genai_client(state.get("api_key"))
+    model = state.get("model", DEFAULT_VISION_MODEL)
+    design_plan = state.get("design_plan", "")
+    room_type = state.get("room_type", "Kitchen")
+    budget = state.get("effective_budget_str", "$15,000")
+
+    palette = extract_color_palette(client=client, design_plan_text=design_plan, model=model)
+    diy_data = generate_diy_vs_pro(client=client, design_plan_text=design_plan, room_type=room_type, budget=budget, model=model)
+
+    dims = state.get("dimensions") or {"length_ft": 14.0, "width_ft": 12.0, "ceiling_ft": 8.0}
+    quantities = calculate_material_quantities(
+        length_ft=dims.get("length_ft", 14.0),
+        width_ft=dims.get("width_ft", 12.0),
+        ceiling_ft=dims.get("ceiling_ft", 8.0),
+        room_type=room_type,
+    )
+    roi = estimate_home_roi(state.get("effective_budget_num", 15000.0), room_type)
+
+    history = list(state.get("execution_history") or [])
+    history.append("analytics_engine")
+    return {
+        "color_palette": palette,
+        "diy_breakdown": diy_data,
+        "material_quantities": quantities,
+        "roi_info": roi,
+        "last_executed_node": "analytics_engine",
+        "execution_history": history,
+    }
+
+
+def route_after_analytics(state: RenovationState) -> str:
+    """Conditional Edge Router: Decides whether to generate an image."""
+    if state.get("skip_rendering", False):
+        return "end_node"
+    return "visual_renderer_node"
+
+
+def visual_renderer_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 6: VisualRenderer - Attempts photorealistic 8K render using SLC prompt."""
+    client = get_genai_client(state.get("api_key"))
+    slc_prompt = state.get("slc_prompt", "")
+    current_image = state.get("current_image")
+
+    rendered_img, img_status = try_generate_image(
+        client=client,
+        prompt=slc_prompt,
+        reference_image=current_image,
+    )
+
+    history = list(state.get("execution_history") or [])
+    history.append("visual_renderer")
+    return {
+        "rendered_image": rendered_img,
+        "image_status": img_status,
+        "last_executed_node": "visual_renderer",
+        "execution_history": history,
+    }
+
+
+def refiner_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 7: Refiner - Applies conversational delta tweaks to design plan and SLC prompt."""
+    client = get_genai_client(state.get("api_key"))
+    model = state.get("model", DEFAULT_VISION_MODEL)
+
+    new_plan, new_slc = refine_renovation_plan(
+        client=client,
+        current_design_plan=state.get("design_plan", ""),
+        user_refinement=state.get("refinement_prompt", ""),
+        model=model,
+    )
+
+    history = list(state.get("execution_history") or [])
+    history.append("refiner")
+    return {
+        "design_plan": new_plan,
+        "slc_prompt": new_slc,
+        "last_executed_node": "refiner",
+        "execution_history": history,
+    }
+
+
+def consultant_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 8: Consultant - Master builder Q&A for building codes, prep & durability."""
+    client = get_genai_client(state.get("api_key"))
+    model = state.get("model", DEFAULT_VISION_MODEL)
+
+    ans = ask_renovation_consultant(
+        client=client,
+        question=state.get("consultant_question", ""),
+        design_plan_text=state.get("design_plan", ""),
+        room_type=state.get("room_type", "Kitchen"),
+        model=model,
+    )
+
+    history = list(state.get("execution_history") or [])
+    history.append("consultant")
+    return {
+        "consultant_answer": ans,
+        "last_executed_node": "consultant",
+        "execution_history": history,
+    }
+
+
+def contractor_rfq_node(state: RenovationState) -> Dict[str, Any]:
+    """Node 9: ContractorRFQ - Drafts ready-to-send contractor bid email."""
+    client = get_genai_client(state.get("api_key"))
+    model = state.get("model", DEFAULT_VISION_MODEL)
+
+    rfq_text = generate_contractor_rfq(
+        client=client,
+        design_plan_text=state.get("design_plan", ""),
+        roadmap_text=state.get("roadmap", ""),
+        room_type=state.get("room_type", "Kitchen"),
+        budget=state.get("effective_budget_str", "$15,000"),
+        model=model,
+    )
+
+    history = list(state.get("execution_history") or [])
+    history.append("contractor_rfq")
+    return {
+        "contractor_rfq": rfq_text,
+        "last_executed_node": "contractor_rfq",
+        "execution_history": history,
+    }
+
+
+def build_renovation_graph() -> StateGraph:
+    """Builds and wires the full LangGraph StateGraph workflow."""
+    builder = StateGraph(RenovationState)
+
+    # Register Nodes
+    builder.add_node("intent_parser", parse_intent_node)
+    builder.add_node("visual_assessor", visual_assessor_node)
+    builder.add_node("design_planner", design_planner_node)
+    builder.add_node("project_coordinator", project_coordinator_node)
+    builder.add_node("analytics_engine", analytics_engine_node)
+    builder.add_node("visual_renderer", visual_renderer_node)
+    builder.add_node("refiner", refiner_node)
+    builder.add_node("consultant", consultant_node)
+    builder.add_node("contractor_rfq", contractor_rfq_node)
+
+    # Initial Edge
+    builder.add_edge(START, "intent_parser")
+
+    # Conditional Routing from IntentParser based on Mode
+    builder.add_conditional_edges(
+        "intent_parser",
+        route_by_mode,
+        {
+            "visual_assessor_node": "visual_assessor",
+            "refiner_node": "refiner",
+            "consultant_node": "consultant",
+            "contractor_rfq_node": "contractor_rfq",
+        },
+    )
+
+    # Full Pipeline Sequence
+    builder.add_edge("visual_assessor", "design_planner")
+    builder.add_edge("design_planner", "project_coordinator")
+    builder.add_edge("project_coordinator", "analytics_engine")
+
+    # Refinement Pipeline Route into Analytics Engine
+    builder.add_edge("refiner", "analytics_engine")
+
+    # Conditional Edge from AnalyticsEngine to VisualRenderer or END
+    builder.add_conditional_edges(
+        "analytics_engine",
+        route_after_analytics,
+        {
+            "visual_renderer_node": "visual_renderer",
+            "end_node": END,
+        },
+    )
+
+    # Final Terminations
+    builder.add_edge("visual_renderer", END)
+    builder.add_edge("consultant", END)
+    builder.add_edge("contractor_rfq", END)
+
+    return builder
+
+
+# Compile the singleton LangGraph instance
+renovation_graph = build_renovation_graph().compile()
+
+
+def run_renovation_graph(state: RenovationState) -> RenovationState:
+    """Executes the complete compiled LangGraph workflow synchronously."""
+    return renovation_graph.invoke(state)
+
+
+def stream_renovation_graph(
+    initial_state: RenovationState,
+) -> Generator[Tuple[str, Dict[str, Any]], None, None]:
+    """Streams node execution step-by-step from the compiled LangGraph workflow.
+    Yields (node_name, state_update_dict).
+    """
+    for event in renovation_graph.stream(initial_state, stream_mode="updates"):
+        for node_name, update in event.items():
+            yield node_name, update
+
+
+def get_graph_mermaid_diagram() -> str:
+    """Returns the visual Mermaid diagram representation of the LangGraph workflow."""
+    try:
+        return renovation_graph.get_graph().draw_mermaid()
+    except Exception as e:
+        logger.warning(f"Failed to generate Mermaid diagram: {e}")
+        return """graph TD
+    START --> intent_parser
+    intent_parser --> visual_assessor
+    intent_parser --> refiner
+    intent_parser --> consultant
+    intent_parser --> contractor_rfq
+    visual_assessor --> design_planner
+    design_planner --> project_coordinator
+    project_coordinator --> analytics_engine
+    refiner --> analytics_engine
+    analytics_engine --> visual_renderer
+    visual_renderer --> END
+    consultant --> END
+    contractor_rfq --> END"""
+
+
+if __name__ == "__main__":
+    import sys
+
+    # Ensure UTF-8 output on Windows
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    print("\n" + "=" * 72)
+    print("🏚️  AI HOME RENOVATION PLANNER — LANGGRAPH ENGINE")
+    print("=" * 72)
+    print("✅ StateGraph compiled and verified successfully!")
+    print(f"📊 Total Graph Nodes: {len(renovation_graph.nodes)}")
+    print("\n🧩 Active StateGraph Nodes:")
+    node_descriptions = {
+        "intent_parser": "Dynamic budget extraction ($Xk) & intent constraint detection",
+        "visual_assessor": "Gemini Multimodal Vision, 360° layout preservation lock",
+        "design_planner": "Surface finishes, paint codes & Stretch Budget Upgrades (+20%)",
+        "project_coordinator": "Line-item budget, roadmap, trades checklist & 8K SLC prompt",
+        "analytics_engine": "5-color HEX swatches, DIY labor savings, quantities & ROI",
+        "visual_renderer": "8K Photorealistic interior image generation",
+        "refiner": "Conversational delta-updater for iterative design adjustments",
+        "consultant": "24/7 master builder technical guidance for permits & prep",
+        "contractor_rfq": "One-click contractor Request for Quotation brief generator",
+    }
+    for n in renovation_graph.nodes:
+        desc = node_descriptions.get(n, "System node")
+        print(f"  • {n:<20} : {desc}")
+
+    print("\n🔀 Conditional Routing Modes:")
+    print("  • mode='full'        -> visual_assessor -> design_planner -> project_coordinator -> analytics_engine -> visual_renderer")
+    print("  • mode='refine'      -> refiner -> analytics_engine -> visual_renderer")
+    print("  • mode='consultant'  -> consultant -> END")
+    print("  • mode='rfq'         -> contractor_rfq -> END")
+
+    print("\n🧪 Running Graph Structure Self-Test...")
+    test_state: RenovationState = {
+        "mode": "full",
+        "user_prompt": "Renovate 1990s kitchen under 12k budget, no paint on oak cabinets",
+        "budget_raw": "$20,000",
+        "room_type": "Kitchen",
+    }
+    parsed = parse_intent_node(test_state)
+    print(f"  [intent_parser test] Budget extracted from prompt : {parsed.get('effective_budget_str')} (Override active: {parsed.get('is_prompt_budget')})")
+    print(f"  [intent_parser test] Intent flags detected        : {parsed.get('intents')}")
+    print(f"  [route_by_mode test] Full mode routes to          : {route_by_mode({'mode': 'full'})}")
+    print(f"  [route_by_mode test] Refine mode routes to        : {route_by_mode({'mode': 'refine'})}")
+    print(f"  [route_by_mode test] Consultant mode routes to    : {route_by_mode({'mode': 'consultant'})}")
+    print(f"  [route_by_mode test] RFQ mode routes to           : {route_by_mode({'mode': 'rfq'})}")
+
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if api_key:
+        print("\n🟢 Google Gemini API Key : Detected in environment")
+    else:
+        print("\n🟡 Google Gemini API Key : None detected (set GOOGLE_API_KEY in .env)")
+
+    print("\n🕸️  Mermaid StateGraph Diagram:")
+    print(get_graph_mermaid_diagram())
+
+    print("=" * 72)
+    print("💡 Next steps:")
+    print("  1. Launch full interactive Web UI:  streamlit run app.py")
+    print("  2. Test scenarios in terminal:     python run_demo.py")
+    print("=" * 72 + "\n")

@@ -1,16 +1,15 @@
-"""AI Home Renovation Planner - Streamlit Application
+"""AI Home Renovation Planner - Streamlit Application (LangGraph Multi-Agent Architecture)
 
-A multimodal multi-agent application built directly with Google GenAI SDK:
-- Visual Assessor: Multimodal layout and condition analysis
-- Design Planner: Exact finish, color, and material specifications
-- Project Coordinator: Budget breakdown, timeline, contractor checklist, and 8K SLC photography prompt
-- Color Palette Extractor: Live interactive color swatch cards & HEX codes
-- Material Quantity Calculator: Square footage, paint gallons, flooring boxes with waste factor
-- ROI & Home Resale Estimator: Estimated home equity gain and ROI percentage
-- DIY vs. Pro Analyzer: Sweat equity feasibility and trade labor savings
-- Contractor RFQ Generator: One-click email brief for licensed contractor bids
-- Renovation Consultant: 24/7 builder Q&A for permits, prep & codes
-- Iterative Refiner: Conversational feedback for instant design tweaks
+Multimodal multi-agent application orchestrated by a LangGraph StateGraph:
+- IntentParser: Dynamic budget regex overrides, intent flags & image matching
+- VisualAssessor: Multimodal layout lock and condition analysis
+- DesignPlanner: Exact finish, color, and material specifications
+- ProjectCoordinator: Budget breakdown, timeline, contractor checklist, and 8K SLC photography prompt
+- AnalyticsEngine: Live HEX swatches, DIY savings, material quantities & resale ROI
+- VisualRenderer: 8K Photorealistic image generation engine
+- Refiner: Conversational delta refinement loop
+- Consultant: 24/7 master builder Q&A for permits, prep & codes
+- ContractorRFQ: One-click email brief for licensed contractor bids
 """
 
 import os
@@ -23,22 +22,18 @@ from dotenv import load_dotenv
 # Load local environment
 load_dotenv()
 
-# Import GenAI engine functions
+# Import LangGraph engine functions and graph
 from renovation_engine import (
+    RenovationState,
+    renovation_graph,
+    run_renovation_graph,
+    stream_renovation_graph,
+    get_graph_mermaid_diagram,
     get_genai_client,
-    assess_room_and_inspiration,
-    generate_design_plan,
-    generate_project_roadmap,
-    try_generate_image,
-    refine_renovation_plan,
-    extract_color_palette,
-    generate_diy_vs_pro,
-    calculate_material_quantities,
-    estimate_home_roi,
-    generate_contractor_rfq,
-    ask_renovation_consultant,
     extract_budget_from_prompt,
     detect_renovation_intents,
+    calculate_material_quantities,
+    estimate_home_roi,
     DEFAULT_VISION_MODEL,
 )
 from pdf_generator import build_renovation_pdf
@@ -201,6 +196,10 @@ if "custom_prompt" not in st.session_state:
     st.session_state.custom_prompt = ""
 if "consultant_chat" not in st.session_state:
     st.session_state.consultant_chat = []
+if "langgraph_history" not in st.session_state:
+    st.session_state.langgraph_history = []
+if "effective_budget_str" not in st.session_state:
+    st.session_state.effective_budget_str = "$15,000"
 
 
 # Sidebar
@@ -293,8 +292,8 @@ with st.sidebar:
     if st.button("🔄 Clear All", use_container_width=True):
         st.session_state.curr_upload_key += 1
         st.session_state.insp_upload_key += 1
-        for k in ["current_image", "inspiration_image", "assessment", "design_plan", "roadmap", "slc_prompt", "rendered_image", "image_status", "color_palette", "diy_breakdown", "rfq_text", "consultant_chat"]:
-            st.session_state[k] = None if k != "consultant_chat" else []
+        for k in ["current_image", "inspiration_image", "assessment", "design_plan", "roadmap", "slc_prompt", "rendered_image", "image_status", "color_palette", "diy_breakdown", "rfq_text", "consultant_chat", "langgraph_history"]:
+            st.session_state[k] = None if k not in ["consultant_chat", "langgraph_history"] else []
         st.session_state.custom_prompt = ""
         st.rerun()
 
@@ -302,8 +301,8 @@ with st.sidebar:
 # Main Application Header
 st.markdown("""
 <div class="main-header">
-    <div class="header-title">🏚️ 🍌 AI Home Renovation Planner</div>
-    <div class="header-sub">Complete multi-agent renovation intelligence: layout preservation, exact paint & finish specs, itemized budgets, ROI resale estimation, DIY savings, and contractor RFQ generation.</div>
+    <div class="header-title">🏚️ AI Home Renovation Planner (LangGraph Engine)</div>
+    <div class="header-sub">Multimodal Multi-Agent Architecture Orchestrated by LangGraph StateGraph & Google GenAI</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -383,85 +382,73 @@ if btn_generate:
         st.error("Please enter a valid Google Gemini API key in the sidebar to proceed.")
     else:
         try:
-            client = get_genai_client(api_key)
-            
             progress_box = st.container()
             with progress_box:
                 p_bar = st.progress(0)
                 status_text = st.empty()
 
-                # Step 1: Visual Assessor
-                status_text.markdown('<div class="agent-pill">📸 Visual Assessor Agent: Inspecting room layout, structure & boundaries...</div>', unsafe_allow_html=True)
-                p_bar.progress(15)
-                assessment = assess_room_and_inspiration(
-                    client=client,
-                    current_image=st.session_state.current_image,
-                    inspiration_image=st.session_state.inspiration_image,
-                    user_prompt=user_prompt,
-                    room_type=room_type,
-                    budget=effective_budget_str,
-                )
-                st.session_state.assessment = assessment
-                p_bar.progress(35)
+                initial_state: RenovationState = {
+                    "mode": "full",
+                    "api_key": api_key,
+                    "user_prompt": user_prompt,
+                    "room_type": room_type,
+                    "target_style": target_style,
+                    "budget_raw": budget_raw,
+                    "current_image": st.session_state.current_image,
+                    "inspiration_image": st.session_state.inspiration_image,
+                    "dimensions": {
+                        "length_ft": float(dim_length),
+                        "width_ft": float(dim_width),
+                        "ceiling_ft": float(dim_height),
+                    },
+                    "execution_history": [],
+                }
 
-                # Step 2: Design Planner
-                status_text.markdown('<div class="agent-pill">🎨 Design Planner Agent: Selecting exact paint codes, countertop stones & finishes...</div>', unsafe_allow_html=True)
-                design_plan = generate_design_plan(
-                    client=client,
-                    assessment_text=assessment,
-                    style_preference=target_style,
-                    room_type=room_type,
-                    budget=effective_budget_str,
-                    user_prompt=user_prompt,
-                )
-                st.session_state.design_plan = design_plan
-                p_bar.progress(55)
+                node_steps = {
+                    "intent_parser": ("🧠 LangGraph Node [intent_parser]: Analyzing prompt budget overrides & user intent...", 15),
+                    "visual_assessor": ("📸 LangGraph Node [visual_assessor]: Locking 360° layout & architectural features...", 35),
+                    "design_planner": ("🎨 LangGraph Node [design_planner]: Specifying exact surface finishes & stretch tiers...", 55),
+                    "project_coordinator": ("🏗️ LangGraph Node [project_coordinator]: Formulating line-item roadmap & 8K SLC brief...", 70),
+                    "analytics_engine": ("📊 LangGraph Node [analytics_engine]: Extracting HEX swatches, DIY savings & resale ROI...", 85),
+                    "visual_renderer": ("📷 LangGraph Node [visual_renderer]: Generating photorealistic architectural rendering...", 95),
+                }
 
-                # Step 3: Project Coordinator
-                status_text.markdown('<div class="agent-pill">🏗️ Project Coordinator: Formulating budget breakdown, timeline & contractor checklist...</div>', unsafe_allow_html=True)
-                roadmap, slc_prompt = generate_project_roadmap(
-                    client=client,
-                    assessment_text=assessment,
-                    design_plan_text=design_plan,
-                    room_type=room_type,
-                    budget=effective_budget_str,
-                    user_prompt=user_prompt,
-                )
-                st.session_state.roadmap = roadmap
-                st.session_state.slc_prompt = slc_prompt
-                p_bar.progress(70)
+                for node_name, update in stream_renovation_graph(initial_state):
+                    if node_name in node_steps:
+                        msg, progress = node_steps[node_name]
+                        status_text.markdown(f'<div class="agent-pill">{msg}</div>', unsafe_allow_html=True)
+                        p_bar.progress(progress)
 
-                # Step 4: Color Swatches Extraction
-                status_text.markdown('<div class="agent-pill">🎨 Palette Specialist: Extracting live HEX swatches & material codes...</div>', unsafe_allow_html=True)
-                palette = extract_color_palette(client=client, design_plan_text=design_plan)
-                st.session_state.color_palette = palette
-                p_bar.progress(80)
-
-                # Step 5: DIY vs Pro Breakdown
-                status_text.markdown('<div class="agent-pill">🛠️ Labor Consultant: Analyzing sweat equity & DIY savings...</div>', unsafe_allow_html=True)
-                diy_data = generate_diy_vs_pro(client=client, design_plan_text=design_plan, room_type=room_type, budget=budget_raw)
-                st.session_state.diy_breakdown = diy_data
-                p_bar.progress(90)
-
-                # Step 6: Rendering Engine
-                status_text.markdown('<div class="agent-pill">📷 Visual Rendering Engine: Generating photorealistic render...</div>', unsafe_allow_html=True)
-                rendered_img, img_status = try_generate_image(
-                    client=client,
-                    prompt=slc_prompt,
-                    reference_image=st.session_state.current_image,
-                )
-                st.session_state.rendered_image = rendered_img
-                st.session_state.image_status = img_status
+                    if "assessment" in update:
+                        st.session_state.assessment = update["assessment"]
+                    if "design_plan" in update:
+                        st.session_state.design_plan = update["design_plan"]
+                    if "roadmap" in update:
+                        st.session_state.roadmap = update["roadmap"]
+                    if "slc_prompt" in update:
+                        st.session_state.slc_prompt = update["slc_prompt"]
+                    if "color_palette" in update:
+                        st.session_state.color_palette = update["color_palette"]
+                    if "diy_breakdown" in update:
+                        st.session_state.diy_breakdown = update["diy_breakdown"]
+                    if "rendered_image" in update:
+                        st.session_state.rendered_image = update["rendered_image"]
+                    if "image_status" in update:
+                        st.session_state.image_status = update["image_status"]
+                    if "effective_budget_str" in update:
+                        st.session_state.effective_budget_str = update["effective_budget_str"]
+                    if "execution_history" in update:
+                        st.session_state.langgraph_history = update["execution_history"]
 
                 p_bar.progress(100)
                 status_text.empty()
                 p_bar.empty()
 
-            st.success("✅ Complete Multi-Agent Renovation Plan & Analysis Ready!")
+            st.success("✅ LangGraph Multi-Agent Renovation Pipeline Completed Successfully!")
             st.rerun()
 
         except Exception as e:
-            st.error(f"Error during renovation pipeline execution: {e}")
+            st.error(f"Error during LangGraph pipeline execution: {e}")
 
 
 # Results Section
@@ -542,7 +529,7 @@ if st.session_state.assessment and st.session_state.design_plan and st.session_s
     st.markdown("<br>", unsafe_allow_html=True)
 
     # Tabbed Detailed Features
-    tab_road, tab_design, tab_quant, tab_diy, tab_rfq, tab_chat, tab_prompt = st.tabs([
+    tab_road, tab_design, tab_quant, tab_diy, tab_rfq, tab_chat, tab_prompt, tab_graph = st.tabs([
         "📋 Budget & Roadmap",
         "🎨 Design Specifications",
         "📐 Material Quantities",
@@ -550,6 +537,7 @@ if st.session_state.assessment and st.session_state.design_plan and st.session_s
         "📄 Contractor RFQ Email",
         "💬 Builder Q&A & Refiner",
         "📷 8K Rendering Prompt",
+        "🕸️ LangGraph Workflow",
     ])
 
     with tab_road:
@@ -590,15 +578,18 @@ if st.session_state.assessment and st.session_state.design_plan and st.session_s
         
         if not st.session_state.rfq_text:
             if st.button("Generate Contractor RFQ Email Draft"):
-                client = get_genai_client(api_key)
-                st.session_state.rfq_text = generate_contractor_rfq(
-                    client=client,
-                    design_plan_text=st.session_state.design_plan,
-                    roadmap_text=st.session_state.roadmap,
-                    room_type=room_type,
-                    budget=budget_raw,
-                )
-                st.rerun()
+                with st.spinner("LangGraph Node [contractor_rfq]: Generating contractor tender brief..."):
+                    res = run_renovation_graph({
+                        "mode": "rfq",
+                        "api_key": api_key,
+                        "design_plan": st.session_state.design_plan,
+                        "roadmap": st.session_state.roadmap,
+                        "room_type": room_type,
+                        "budget_raw": budget_raw,
+                        "effective_budget_str": effective_budget_str,
+                    })
+                    st.session_state.rfq_text = res.get("contractor_rfq")
+                    st.rerun()
         else:
             st.text_area("Contractor Email Draft", value=st.session_state.rfq_text, height=350)
             if st.button("Regenerate RFQ Draft"):
@@ -618,27 +609,31 @@ if st.session_state.assessment and st.session_state.design_plan and st.session_s
         chat_input = st.text_input("Ask a question or request a design tweak:", placeholder="e.g. Can I paint over oak cabinets without sanding to bare wood? OR Make cabinets dark green.")
         if st.button("Submit to Consultant", key="btn_consultant"):
             if chat_input:
-                client = get_genai_client(api_key)
-                with st.spinner("Consulting master builder..."):
+                with st.spinner("LangGraph Agent Consulting..."):
                     # Check if it's a tweak or a question
                     if any(w in chat_input.lower() for w in ["make", "change", "switch", "tweak", "replace", "color"]):
-                        new_plan, new_slc = refine_renovation_plan(
-                            client=client,
-                            current_design_plan=st.session_state.design_plan,
-                            user_refinement=chat_input,
-                        )
-                        st.session_state.design_plan = new_plan
-                        st.session_state.slc_prompt = new_slc
-                        # Also refresh swatches
-                        st.session_state.color_palette = extract_color_palette(client=client, design_plan_text=new_plan)
-                        ans = f"✅ I've updated the design specifications and color palette with your request: '{chat_input}'. Check the 'Design Specifications' tab to see the revised finishes!"
+                        res = run_renovation_graph({
+                            "mode": "refine",
+                            "api_key": api_key,
+                            "design_plan": st.session_state.design_plan,
+                            "refinement_prompt": chat_input,
+                            "room_type": room_type,
+                            "skip_rendering": True,
+                        })
+                        st.session_state.design_plan = res.get("design_plan")
+                        st.session_state.slc_prompt = res.get("slc_prompt")
+                        if res.get("color_palette"):
+                            st.session_state.color_palette = res["color_palette"]
+                        ans = f"✅ [LangGraph Node: refiner & analytics_engine] Updated design specifications and color palette with: '{chat_input}'. Check the 'Design Specifications' tab to see the revised finishes!"
                     else:
-                        ans = ask_renovation_consultant(
-                            client=client,
-                            question=chat_input,
-                            design_plan_text=st.session_state.design_plan,
-                            room_type=room_type,
-                        )
+                        res = run_renovation_graph({
+                            "mode": "consultant",
+                            "api_key": api_key,
+                            "consultant_question": chat_input,
+                            "design_plan": st.session_state.design_plan,
+                            "room_type": room_type,
+                        })
+                        ans = res.get("consultant_answer", "No response received.")
                     st.session_state.consultant_chat.append((chat_input, ans))
                     st.rerun()
 
@@ -646,6 +641,34 @@ if st.session_state.assessment and st.session_state.design_plan and st.session_s
         st.markdown("#### Architectural Photography Prompt (Subject, Lighting, Camera Formula)")
         st.markdown("This prompt is engineered to generate professional magazine-grade interior photography while keeping the exact layout of your space:")
         st.code(st.session_state.slc_prompt, language="text")
+
+    with tab_graph:
+        st.markdown("#### 🕸️ LangGraph StateGraph Architecture & Live Topology")
+        st.markdown("The entire multi-agent renovation engine operates as a stateful, compiled **LangGraph `StateGraph`**.")
+
+        col_g1, col_g2 = st.columns([1, 1])
+        with col_g1:
+            st.markdown("##### 📌 State Workflow Graph")
+            st.markdown(f"""```mermaid
+{get_graph_mermaid_diagram()}
+```""")
+
+        with col_g2:
+            st.markdown("##### 🧩 Registered LangGraph Nodes")
+            st.markdown("""
+- **`intent_parser`**: Regex budget extraction (`$Xk`), intent detection (min-cost, no-paint) & image hashing.
+- **`visual_assessor`**: Gemini Multimodal Vision, 360° layout preservation lock & space condition audit.
+- **`design_planner`**: Surface finishes, paint codes, edge profiles & Stretch Budget Upgrades (+20%).
+- **`project_coordinator`**: Itemized budget breakdown, trades checklist, timeline & 8K SLC Photography prompt.
+- **`analytics_engine`**: Live 5-color HEX palette swatches, DIY sweat equity analysis & resale ROI calculation.
+- **`visual_renderer`**: Photorealistic 8K image generation engine (`gemini-3-pro-image-preview`).
+- **`refiner`**: Conversational delta-updater for finish swaps and styling tweaks.
+- **`consultant`**: 24/7 master builder technical guidance on permits, prep & building codes.
+- **`contractor_rfq`**: One-click professional contractor Request for Quotation generator.
+            """)
+            if st.session_state.langgraph_history:
+                st.markdown("##### ⏱️ Recent Node Execution Sequence")
+                st.write(" ➡️ ".join([f"`{node}`" for node in st.session_state.langgraph_history]))
 
     # Download Reports (Both PDF and Markdown)
     st.markdown("---")

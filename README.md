@@ -1,46 +1,47 @@
-# 🏚️ 🍌 AI Home Renovation Planner (Streamlit App)
+# 🏚️ AI Home Renovation Planner (LangGraph Engine)
 
-An end-to-end multi-agent renovation planning and visual intelligence suite powered directly by the **Google GenAI** (`gemini-3-flash-preview`) and **Streamlit**. Upload real room photos and inspiration styles, preserve your physical layout, calculate itemized budgets and ROI, analyze DIY savings, and export print-ready PDF and Markdown dossiers.
+An end-to-end multi-agent renovation planning and visual intelligence suite powered by **LangGraph** (`StateGraph`) and **Google GenAI** (`gemini-3-flash-preview` / `gemini-2.5-flash`), featuring an interactive **Streamlit** dashboard. Upload real room photos and inspiration styles, preserve physical layout footprints, calculate itemized budgets and ROI, analyze DIY savings, and export print-ready PDF and Markdown dossiers.
 
 ---
 
-## 🧠 System Architecture Overview
+## 🕸️ LangGraph StateGraph Architecture
 
-The system orchestrates specialized agent personas sequentially to turn amateur room photos into professional contractor briefs:
+The system coordinates specialized agent personas through a compiled **LangGraph `StateGraph`** with conditional routing and streaming execution:
 
+```mermaid
+graph TD;
+	__start__([Start]):::first --> intent_parser;
+	intent_parser -. Mode: Full .-> visual_assessor;
+	intent_parser -. Mode: Refine .-> refiner;
+	intent_parser -. Mode: Consultant .-> consultant;
+	intent_parser -. Mode: RFQ .-> contractor_rfq;
+	
+	visual_assessor --> design_planner;
+	design_planner --> project_coordinator;
+	project_coordinator --> analytics_engine;
+	refiner --> analytics_engine;
+	
+	analytics_engine -. Render .-> visual_renderer;
+	analytics_engine -. Skip .-> __end__([End]):::last;
+	visual_renderer --> __end__;
+	consultant --> __end__;
+	contractor_rfq --> __end__;
+
+	classDef default fill:#1e293b,stroke:#3b82f6,color:#f8fafc,stroke-width:1px
+	classDef first fill:#1e3a8a,stroke:#60a5fa,color:#f8fafc
+	classDef last fill:#0f172a,stroke:#94a3b8,color:#f8fafc
 ```
-                            ┌───────────────────────────────────────────────┐
-                            │            USER INPUT & MULTIMODAL            │
-                            │  Room Photo(s) + Inspiration Photo + Prompt   │
-                            └───────────────────────┬───────────────────────┘
-                                                    │
-                                                    ▼
-                            ┌───────────────────────────────────────────────┐
-                            │        DYNAMIC INTENT & BUDGET PARSER         │
-                            │  - Regex Prompt Budget Extraction ($Xk)       │
-                            │  - Min-Money / Zero-Paint / Staging Detection │
-                            │  - Duplicate Image Hash Matching              │
-                            └───────────────────────┬───────────────────────┘
-                                                    │
-                 ┌──────────────────────────────────┼──────────────────────────────────┐
-                 ▼                                  ▼                                  ▼
-      ┌─────────────────────┐            ┌────────────────────┐            ┌──────────────────────┐
-      │  1. VisualAssessor  │            │  2. DesignPlanner  │            │3. ProjectCoordinator │
-      │ - 360° Layout Lock  │ ─────────▶ │ - Specific Finishes│ ─────────▶ │ - Itemized Roadmap   │
-      │ - Window/Door Spans │            │ - Benjamin Moore   │            │ - Stretch Tier (+$X) │
-      │ - Style Extraction  │            │ - Staging Guidance │            │ - SLC 8K Render Brief│
-      └─────────────────────┘            └────────────────────┘            └──────────┬───────────┘
-                                                                                      │
-                 ┌──────────────────────────────────┬─────────────────────────────────┘
-                 ▼                                  ▼
-      ┌─────────────────────┐            ┌────────────────────┐
-      │ 4. Analytics Suite  │            │ 5. Dual Exporter   │
-      │ - Palette & HEX     │            │ - Print PDF (fpdf2)│
-      │ - Resale ROI & Equity│           │ - Full Markdown    │
-      │ - Material Quantities│           │ - Contractor RFQ   │
-      │ - DIY vs Pro Labor  │            │                    │
-      └─────────────────────┘            └────────────────────┘
-```
+
+### 🧩 Registered LangGraph Nodes:
+1. **`intent_parser`**: Regex budget parser (`$Xk`), intent detection (min-cost, no-paint) & duplicate image matching.
+2. **`visual_assessor`**: Gemini Multimodal Vision, 360° layout preservation lock & space condition audit.
+3. **`design_planner`**: Surface finish specifications, Benjamin Moore/Sherwin-Williams paint codes & Stretch Budget Upgrades (+20%).
+4. **`project_coordinator`**: Itemized baseline budget, trades checklist, timeline & 8K SLC Photography prompt.
+5. **`analytics_engine`**: Live 5-color HEX palette swatches, DIY sweat equity analysis & resale ROI calculation.
+6. **`visual_renderer`**: Photorealistic 8K image generation engine (`gemini-3-pro-image-preview`).
+7. **`refiner`**: Conversational delta-updater for finish swaps and styling tweaks.
+8. **`consultant`**: 24/7 master builder technical guidance on permits, prep & building codes.
+9. **`contractor_rfq`**: One-click professional contractor Request for Quotation generator.
 
 ---
 
